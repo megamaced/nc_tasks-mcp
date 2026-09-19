@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.2 — Leap seconds
+
+Follow-up to the #5 review: the v0.1.1 validation deliberately allowed second `60`, and that turned out to reintroduce, in miniature, the exact failure the issue was about.
+
+- **A leap second is refused rather than silently shifted.** RFC 5545 permits `:60`, so `2016-12-31T23:59:60Z` is a legal spelling — but `ICAL.Time` and `Date` are POSIX-time based and have no leap second, so it became `20170101T000000Z` and the caller got back a different instant from the one it asked for. Preserving it would mean carrying the raw text alongside every parsed value through parsing, editing, sorting and serialising, and the first other CalDAV client or server to touch the task would normalise it anyway — so the guarantee would not survive a round-trip. It is now rejected with an error that says it is legal but unrepresentable, and what to use instead.
+- **`parseDateInput` and `dateBoundKey` no longer disagree.** The same `:60` value was accepted as a task date but rejected as a filter bound, because `Date.parse` cannot read second 60. A test now asserts the two share one policy across every spelling, which is the invariant that was actually broken.
+- Two regression tests added for the general property: every accepted spelling round-trips to exactly what was requested.
+
 ## v0.1.1 — Review fixes
 
 Twelve issues raised against v0.1.0 (#2–#13), all confirmed against the code and fixed.

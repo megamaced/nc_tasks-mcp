@@ -130,7 +130,7 @@ function assertRealDate(year: number, month: number, day: number, original: stri
   }
 }
 
-/** Reject a time that looks well-formed but is out of range. */
+/** Reject a time that looks well-formed but is out of range or unrepresentable. */
 function assertRealTime(hour: number, minute: number, second: number, original: string): void {
   if (hour > 23) {
     throw new IcalError(`Invalid time in "${original}": hour ${hour} is not between 00 and 23.`);
@@ -138,9 +138,28 @@ function assertRealTime(hour: number, minute: number, second: number, original: 
   if (minute > 59) {
     throw new IcalError(`Invalid time in "${original}": minute ${minute} is not between 00 and 59.`);
   }
-  // 60 is a leap second, which RFC 5545 permits in a UTC value.
+  if (second === 60) {
+    // RFC 5545 does allow `60` here, for a positive leap second — so this is a
+    // legal spelling that cannot be carried, rather than an invalid one, and
+    // the message says so.
+    //
+    // Nothing in the stack can represent it. `ICAL.Time` and `Date` are both
+    // POSIX-time based, where leap seconds do not exist: the value becomes
+    // 00:00:00 the following day, which is the silent rewrite this validation
+    // exists to prevent. Preserving it would mean carrying the raw text
+    // alongside every parsed value through parsing, editing, sorting and
+    // serialising — and it would still be normalised by the first other client
+    // or server to touch the task, so the guarantee would not survive a
+    // round-trip anyway. Refusing is the only honest option of the two.
+    throw new IcalError(
+      `"${original}" specifies second 60, a leap second. RFC 5545 allows it, but it cannot be ` +
+        'stored without being silently changed to 00:00:00 the next day, so it is refused ' +
+        'rather than corrupted. Use :59 for the last second of the minute, or the following ' +
+        '00:00:00 for the instant after it.',
+    );
+  }
   if (second > 60) {
-    throw new IcalError(`Invalid time in "${original}": second ${second} is not between 00 and 60.`);
+    throw new IcalError(`Invalid time in "${original}": second ${second} is not between 00 and 59.`);
   }
 }
 

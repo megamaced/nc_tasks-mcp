@@ -921,6 +921,37 @@ describe('parseDateInput rejects dates that do not exist (#5)', () => {
     assert.throws(() => parseDateInput('2026-01-01T12:00:61'), /second 61/);
   });
 
+  it('refuses a leap second rather than shifting it to the next day', () => {
+    // RFC 5545 permits ":60", but ICAL.Time and Date are POSIX-based and turn
+    // it into 00:00:00 the following day — the silent rewrite this validation
+    // exists to prevent.
+    assert.throws(() => parseDateInput('2016-12-31T23:59:60Z'), /leap second/);
+    assert.throws(() => parseDateInput('2016-12-31T23:59:60'), /leap second/);
+    assert.throws(
+      () => parseDateInput('2016-12-31T23:59:60', 'Europe/London'),
+      /leap second/,
+    );
+    // The seconds either side are ordinary values and still work.
+    assert.equal(parseDateInput('2016-12-31T23:59:59Z').toICALString(), '20161231T235959Z');
+    assert.equal(parseDateInput('2017-01-01T00:00:00Z').toICALString(), '20170101T000000Z');
+  });
+
+  it('never returns a value different from the one requested', () => {
+    // The property the whole issue is about: for every accepted spelling, what
+    // comes back is what was asked for.
+    const cases: [string, string][] = [
+      ['2026-03-01', '20260301'],
+      ['2026-03-01T14:30:00Z', '20260301T143000Z'],
+      ['2026-03-01T14:30Z', '20260301T143000Z'],
+      ['2026-03-01T14:30:00', '20260301T143000'],
+      ['2024-02-29', '20240229'],
+      ['2016-12-31T23:59:59Z', '20161231T235959Z'],
+    ];
+    for (const [input, expected] of cases) {
+      assert.equal(parseDateInput(input).toICALString(), expected, `round-trip of ${input}`);
+    }
+  });
+
   it('refuses a wall-clock time the zone skips for daylight saving', () => {
     // London jumps 01:00 -> 02:00 on 2026-03-29, so 01:30 never happens.
     assert.throws(
@@ -1105,6 +1136,41 @@ describe('date bounds do not depend on the process timezone (#6)', () => {
 
   it('still rejects an impossible bound', () => {
     assert.throws(() => dateBoundKey('2026-02-30', 'dueBefore'), IcalError);
+  });
+
+  it('accepts exactly what parseDateInput accepts', () => {
+    // These two disagreed once: parseDateInput allowed a leap second that
+    // Date.parse could not read, so a value accepted as a task date was
+    // rejected as a bound. Whatever the policy, the two have to share it.
+    const spellings = [
+      '2026-03-01',
+      '2026-03-01T14:30:00Z',
+      '2026-03-01T14:30Z',
+      '2026-03-01T14:30:00',
+      '2016-12-31T23:59:60Z',
+      '2026-02-30',
+      '2026-01-01T25:00:00',
+      'nonsense',
+    ];
+    for (const spelling of spellings) {
+      const dateOk = (() => {
+        try {
+          parseDateInput(spelling);
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      const boundOk = (() => {
+        try {
+          dateBoundKey(spelling);
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      assert.equal(boundOk, dateOk, `disagreement on "${spelling}"`);
+    }
   });
 
   it('gives the same answer under two very different process timezones', async () => {
