@@ -1320,7 +1320,10 @@ describe('an ambiguous uid is refused rather than guessed (#2)', () => {
   /** A CalDAV server with two task lists, both holding the given uid. */
   function davHandler(uid: string) {
     return (req: IncomingMessage, res: ServerResponse): void => {
-      const url = req.url ?? '';
+      // Escaped before it is echoed into the response: the request path is
+      // attacker-controlled even in a test fixture, and reflecting it raw is
+      // both invalid XML and the shape of a reflected-XSS bug.
+      const url = escapeXml(req.url ?? '');
       const send = (body: string): void => {
         res.writeHead(207, { 'Content-Type': 'application/xml; charset=utf-8' });
         res.end(body);
