@@ -85,6 +85,30 @@ function backoffDelay(attempt: number): number {
   return Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
 }
 
+/**
+ * Largest number of redirects followed within the configured origin.
+ *
+ * Nextcloud behind a reverse proxy legitimately redirects — a missing trailing
+ * slash on a collection, most commonly — but never more than once or twice.
+ */
+const MAX_REDIRECTS = 5;
+
+/** A redirect this server declined to follow. */
+export class RedirectRefusedError extends Error {
+  public readonly hint =
+    'Point NEXTCLOUD_URL directly at the Nextcloud origin. A DAV endpoint that ' +
+    'redirects elsewhere is not one this server will follow.';
+
+  constructor(from: string, to: string) {
+    super(
+      `Refused to follow a redirect from ${from} to ${to}: it leaves the configured ` +
+        'Nextcloud origin. [Point NEXTCLOUD_URL directly at the Nextcloud origin. A DAV ' +
+        'endpoint that redirects elsewhere is not one this server will follow.]',
+    );
+    this.name = 'RedirectRefusedError';
+  }
+}
+
 /** A request that exceeded its deadline. Never retried. */
 export class TimeoutError extends Error {
   public readonly hint =
@@ -320,11 +344,12 @@ export class NextcloudClient {
 
       let res: Response;
       try {
-        res = await fetch(url, { ...init, signal: AbortSignal.timeout(this.timeoutMs) });
+        res = await this.fetchFollowingSameOrigin(url, init, label);
       } catch (err) {
         if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
           throw new TimeoutError(label, this.timeoutMs);
         }
+        if (err instanceof RedirectRefusedError) throw err;
         if (isTransientNetworkError(err) && replayable && attempt < MAX_RETRIES) {
           lastError = err as Error;
           await sleep(backoffDelay(attempt));
@@ -347,6 +372,79 @@ export class NextcloudClient {
       throw httpError;
     }
     throw lastError ?? new Error('Unexpected retry exhaustion');
+  }
+
+  /**
+   * Fetch, following redirects only while they stay on the configured origin.
+   *
+   * Node's fetch follows redirects itself, and follows them anywhere. That
+   * turns the configured Nextcloud endpoint into a lever: a malicious or
+   * compromised server can answer a DAV request with a 302 to any address the
+   * host can reach — `localhost`, a cloud metadata service, something else on
+   * the LAN — and this process will fetch it and hand the body back through
+   * tool output. Node does strip `Authorization` when the origin changes, which
+   * protects the credential but neither prevents the request nor stops the
+   * response being disclosed; on a body-carrying method it would also forward
+   * the task content to whatever answered.
+   *
+   * So redirects are resolved here instead, against an explicit policy: same
+   * origin only, bounded in number. The one concession is an http→https upgrade
+   * on the same host and port, which is a strict improvement rather than a
+   * redirection.
+   */
+  private async fetchFollowingSameOrigin(
+    url: string,
+    init: RequestInit,
+    label: string,
+  ): Promise<Response> {
+    let current = url;
+
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const res = await fetch(current, {
+        ...init,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+
+      // 304 shares the 3xx range but is a cache validator, not a redirect.
+      if (res.status < 300 || res.status > 399 || res.status === 304) return res;
+
+      const location = res.headers.get('Location');
+      if (!location) return res; // A 3xx with nowhere to go; let the caller judge.
+
+      let next: URL;
+      try {
+        next = new URL(location, current);
+      } catch {
+        throw new RedirectRefusedError(current, location);
+      }
+      if (!this.isSameOrigin(next, current)) {
+        throw new RedirectRefusedError(current, next.toString());
+      }
+      // Discard the unread body before reusing the connection.
+      await res.body?.cancel().catch(() => {});
+      current = next.toString();
+      debug(`Redirect ${hop + 1}/${MAX_REDIRECTS} for ${label} -> ${current}`);
+    }
+
+    throw new RedirectRefusedError(url, `more than ${MAX_REDIRECTS} redirects`);
+  }
+
+  /** Whether `next` stays on the origin of `from`, allowing an https upgrade. */
+  private isSameOrigin(next: URL, from: string): boolean {
+    let base: URL;
+    try {
+      base = new URL(from);
+    } catch {
+      return false;
+    }
+    if (next.origin === base.origin) return true;
+    return (
+      base.protocol === 'http:' &&
+      next.protocol === 'https:' &&
+      next.hostname === base.hostname &&
+      next.port === base.port
+    );
   }
 
   /**

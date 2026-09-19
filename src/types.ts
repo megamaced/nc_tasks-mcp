@@ -106,7 +106,15 @@ export interface Task {
   /** Manual sort position, from `X-APPLE-SORT-ORDER`. */
   sortOrder?: number;
   /**
-   * Recurrence rule, verbatim, when the task repeats.
+   * True when the task repeats, by either mechanism below.
+   *
+   * This, not `recurrenceRule` alone, is what marks a task as a series.
+   * Recurrence can be expressed with explicit dates and no rule at all, and a
+   * check that looks only for `RRULE` would wave those through.
+   */
+  recurring: boolean;
+  /**
+   * Recurrence rule, verbatim, when the task repeats by rule.
    *
    * Reported so a caller knows not to treat the task as a one-off, but not
    * editable: completing a recurring `VTODO` is defined to advance `DUE` rather
@@ -114,6 +122,12 @@ export interface Task {
    * series. Edit recurrence in the Tasks UI.
    */
   recurrenceRule?: string;
+  /**
+   * Explicit recurrence dates from `RDATE`, verbatim, when there are any.
+   *
+   * RFC 5545 allows a series to be defined entirely by these, with no `RRULE`.
+   */
+  recurrenceDates?: string;
   /** Number of `VALARM` reminders on the task. Preserved on write, not editable. */
   alarmCount: number;
 }

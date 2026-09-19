@@ -141,12 +141,12 @@ export function parseXml(source: string): XmlElement {
     const lt = source.indexOf('<', pos);
 
     if (lt === -1) {
-      // Trailing text. Only whitespace may follow the root element.
-      appendText(stack, source.slice(pos));
+      // Trailing character data. Only whitespace may follow the root element.
+      appendText(stack, source.slice(pos), fail);
       break;
     }
 
-    if (lt > pos) appendText(stack, source.slice(pos, lt));
+    if (lt > pos) appendText(stack, source.slice(pos, lt), fail);
     pos = lt;
 
     // <?xml … ?> and other processing instructions.
@@ -168,7 +168,7 @@ export function parseXml(source: string): XmlElement {
       const end = source.indexOf(']]>', pos + 9);
       if (end === -1) fail('Unterminated CDATA section');
       // CDATA is literal: appended without entity resolution.
-      appendRawText(stack, source.slice(pos + 9, end));
+      appendRawText(stack, source.slice(pos + 9, end), fail);
       pos = end + 3;
       continue;
     }
@@ -240,13 +240,33 @@ export function parseXml(source: string): XmlElement {
   return root;
 }
 
-function appendText(stack: Frame[], text: string): void {
-  if (stack.length === 0) return; // Whitespace around the root element.
+/**
+ * Character data outside the root element is an error, not noise.
+ *
+ * XML permits only whitespace (and a leading BOM) around the document element.
+ * Ignoring anything else lets a truncated response, or an HTML error page a
+ * proxy concatenated onto one, parse into a plausible-looking tree — exactly
+ * the failure the parser exists to make impossible. A `multistatus` recovered
+ * from half a document reports "no tasks", which is indistinguishable from an
+ * empty list and far worse than an error.
+ */
+function appendText(stack: Frame[], text: string, fail: (message: string) => never): void {
+  if (stack.length === 0) {
+    // U+FEFF is a byte-order mark, legal before the declaration and not content.
+    if (text.replace(/﻿/g, '').trim() !== '') {
+      fail('Character data outside the root element');
+    }
+    return;
+  }
   stack[stack.length - 1]!.element.text += decodeEntities(text);
 }
 
-function appendRawText(stack: Frame[], text: string): void {
-  if (stack.length === 0) return;
+function appendRawText(stack: Frame[], text: string, fail: (message: string) => never): void {
+  if (stack.length === 0) {
+    // A CDATA section is content by definition, so it can never sit at the top
+    // level — unlike whitespace, there is no benign reading of it here.
+    fail('CDATA section outside the root element');
+  }
   stack[stack.length - 1]!.element.text += text;
 }
 

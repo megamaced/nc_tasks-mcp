@@ -104,6 +104,87 @@ function assertValidTimezone(timezone: string): void {
   }
 }
 
+/** Days in a month, accounting for leap years. */
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/**
+ * Reject a date that looks well-formed but does not exist.
+ *
+ * `ICAL.Time` and `Date.UTC` both *normalise* out-of-range fields rather than
+ * refusing them, so `2026-02-30` silently becomes 2 March and `2026-13-01`
+ * becomes January 2027. A caller would get a successful write back with a date
+ * it never asked for, which is data corruption wearing a success message.
+ */
+function assertRealDate(year: number, month: number, day: number, original: string): void {
+  if (month < 1 || month > 12) {
+    throw new IcalError(`Invalid date "${original}": month ${month} is not between 01 and 12.`);
+  }
+  const max = daysInMonth(year, month);
+  if (day < 1 || day > max) {
+    throw new IcalError(
+      `Invalid date "${original}": ${year}-${String(month).padStart(2, '0')} has ${max} days, ` +
+        `so day ${day} does not exist.`,
+    );
+  }
+}
+
+/** Reject a time that looks well-formed but is out of range. */
+function assertRealTime(hour: number, minute: number, second: number, original: string): void {
+  if (hour > 23) {
+    throw new IcalError(`Invalid time in "${original}": hour ${hour} is not between 00 and 23.`);
+  }
+  if (minute > 59) {
+    throw new IcalError(`Invalid time in "${original}": minute ${minute} is not between 00 and 59.`);
+  }
+  // 60 is a leap second, which RFC 5545 permits in a UTC value.
+  if (second > 60) {
+    throw new IcalError(`Invalid time in "${original}": second ${second} is not between 00 and 60.`);
+  }
+}
+
+/** The wall-clock fields a zone shows at a given instant. */
+function wallClockAt(utcMs: number, timezone: string): number[] {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(utcMs));
+  const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  return [get('year'), get('month'), get('day'), get('hour'), get('minute'), get('second')];
+}
+
+/**
+ * Resolve a wall-clock string in a named zone to a UTC timestamp.
+ *
+ * Returns undefined when the string is not a plain local date-time, so callers
+ * that also handle UTC and whole-day values can fall through.
+ */
+export function wallClockToUtcMs(value: string, timezone: string): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value.trim());
+  if (!match) return undefined;
+  try {
+    assertValidTimezone(timezone);
+  } catch {
+    return undefined;
+  }
+  const fields = [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6] ?? '0'),
+  ];
+  return zonedToUtc(fields, timezone).getTime();
+}
+
 /**
  * Convert a caller-supplied date string into an `ICAL.Time`.
  *
@@ -125,6 +206,8 @@ export function parseDateInput(value: string, timezone?: string): ICAL.Time {
           'give a time as well (e.g. "2026-03-01T09:00:00").',
       );
     }
+    const [y, mo, d] = text.split('-').map(Number) as [number, number, number];
+    assertRealDate(y, mo, d, text);
     return ICAL.Time.fromDateString(text);
   }
 
@@ -139,6 +222,17 @@ export function parseDateInput(value: string, timezone?: string): ICAL.Time {
   const [, datePart, timePart, zulu] = match as unknown as [string, string, string, string?];
   const time = timePart.length === 5 ? `${timePart}:00` : timePart;
 
+  const fields = [...datePart.split('-'), ...time.split(':')].map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  assertRealDate(fields[0], fields[1], fields[2], text);
+  assertRealTime(fields[3], fields[4], fields[5], text);
+
   if (zulu) {
     if (timezone) {
       throw new IcalError(
@@ -150,8 +244,30 @@ export function parseDateInput(value: string, timezone?: string): ICAL.Time {
 
   if (timezone) {
     assertValidTimezone(timezone);
-    const fields = [...datePart.split('-'), ...time.split(':')].map(Number);
-    return ICAL.Time.fromJSDate(zonedToUtc(fields, timezone), true);
+    const resolved = zonedToUtc(fields, timezone);
+
+    // A wall-clock reading that the zone skips over — the hour a spring-forward
+    // transition deletes — has no instant to resolve to, and the arithmetic
+    // silently lands on a different time instead. Reading the result back in
+    // the same zone is the only way to notice: if it does not show the reading
+    // that was asked for, that reading never happens there.
+    //
+    // An ambiguous reading, from a fall-back transition, happens twice. It is
+    // accepted rather than refused — it is a real answer to a real question —
+    // and this arithmetic settles on the second, post-transition instant, since
+    // the offset it measures is the one in force after the clocks change. Both
+    // readings are defensible; what matters is that the choice is deterministic
+    // and does not depend on the machine.
+    const actual = wallClockAt(resolved.getTime(), timezone);
+    if (actual.some((value, i) => value !== fields[i])) {
+      const shown = `${String(actual[3]).padStart(2, '0')}:${String(actual[4]).padStart(2, '0')}`;
+      throw new IcalError(
+        `"${datePart}T${time}" does not exist in ${timezone} — the clocks skip it for a ` +
+          `daylight-saving change, and it would silently become ${shown}. Pick a time outside ` +
+          'the skipped hour, or give the time as UTC.',
+      );
+    }
+    return ICAL.Time.fromJSDate(resolved, true);
   }
 
   // No zone and no Z: a floating time, which means the same wall-clock reading
@@ -298,6 +414,22 @@ export function taskFromIcs(
   }
 
   const rrule = vtodo.getFirstProperty('rrule');
+  // A series can be defined entirely by explicit dates, with no rule at all.
+  const rdates = vtodo.getAllProperties('rdate');
+  const recurrenceDates =
+    rdates.length > 0
+      ? rdates
+          .map((p) =>
+            p
+              .getValues()
+              // The iCalendar spelling, not the ISO one: this is reported as the
+              // raw property value, and `toString()` reformats a Time.
+              .map((v) => (v instanceof ICAL.Time ? v.toICALString() : String(v)))
+              .join(','),
+          )
+          .filter((s) => s !== '')
+          .join(',')
+      : undefined;
 
   return {
     uid,
@@ -320,7 +452,9 @@ export function taskFromIcs(
     pinned: readBooleanish(vtodo, 'x-pinned'),
     hideSubtasks: readBooleanish(vtodo, 'x-oc-hidesubtasks'),
     sortOrder: readInt(vtodo, 'x-apple-sort-order'),
+    recurring: rrule !== null || recurrenceDates !== undefined,
     recurrenceRule: rrule ? rrule.getFirstValue()?.toString() : undefined,
+    recurrenceDates,
     alarmCount: vtodo.getAllSubcomponents('valarm').length,
   };
 }
@@ -460,7 +594,63 @@ export function applyEdits(vtodo: ICAL.Component, edits: TaskEdits): void {
     setOrRemove(vtodo, 'x-apple-sort-order', edits.sortOrder);
   }
 
+  // Checked only when this edit touched a date, so pre-existing contradictions
+  // written by another client do not block an unrelated change.
+  if (edits.due !== undefined || edits.start !== undefined) {
+    assertDateInvariants(vtodo);
+  }
+
   touch(vtodo);
+}
+
+/**
+ * Reject a `VTODO` whose date properties contradict each other.
+ *
+ * RFC 5545 §3.6.2 constrains the combination, not just each property alone:
+ * `DUE` and `DTSTART` must share a value type, `DUE` must be later than
+ * `DTSTART`, and `DUE` and `DURATION` must not both appear. A server is free to
+ * reject the `PUT`, and a client that accepts it is free to interpret the task
+ * differently from the next one — an all-day start with a timed due date has no
+ * agreed meaning.
+ *
+ * Only called when an edit touched a date, so a task another client already
+ * wrote in an invalid state stays readable and editable in every other respect.
+ * This stops the server creating the contradiction; it does not appoint it
+ * arbiter of data it did not write.
+ */
+export function assertDateInvariants(vtodo: ICAL.Component): void {
+  const dueProp = vtodo.getFirstProperty('due');
+  if (!dueProp) return;
+
+  if (vtodo.hasProperty('duration')) {
+    throw new IcalError(
+      'This task has a DURATION, and RFC 5545 does not allow DUE and DURATION on the same ' +
+        'task. Remove the duration in the Nextcloud Tasks app first — it is left in place ' +
+        'here rather than silently deleted.',
+    );
+  }
+
+  const startProp = vtodo.getFirstProperty('dtstart');
+  if (!startProp) return;
+
+  const due = dueProp.getFirstValue();
+  const start = startProp.getFirstValue();
+  if (!(due instanceof ICAL.Time) || !(start instanceof ICAL.Time)) return;
+
+  if (due.isDate !== start.isDate) {
+    const describe = (t: ICAL.Time): string => (t.isDate ? 'a whole day' : 'a date and time');
+    throw new IcalError(
+      `The start is ${describe(start)} but the due date is ${describe(due)}. RFC 5545 requires ` +
+        'both to be the same kind. Give them both as "YYYY-MM-DD", or both with a time.',
+    );
+  }
+
+  if (due.compare(start) <= 0) {
+    throw new IcalError(
+      `The due date (${due.toString()}) is not later than the start date (${start.toString()}). ` +
+        'RFC 5545 requires DUE to come after DTSTART.',
+    );
+  }
 }
 
 /** Stamp a component as modified now. */

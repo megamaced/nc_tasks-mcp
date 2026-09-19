@@ -54,6 +54,18 @@ These cost real debugging time and are not obvious from the API surface.
 
 19. **Writing a `TZID` without a matching `VTIMEZONE` produces non-conformant iCalendar.** ical.js cannot generate one for an arbitrary zone without a bundled tz database. `tasks-mcp` therefore resolves a zoned wall-clock time to its UTC instant and stores that: exact, unambiguous, and rendered in the reader's own zone by every client.
 
+20. **`RDATE` defines a series without an `RRULE`.** RFC 5545 §3.8.5.2 lets recurrence be expressed entirely as explicit dates. A recurrence guard that looks only for `RRULE` waves those through, and completing one closes the whole series — the exact outcome the guard exists to prevent.
+
+21. **`DUE`, `DTSTART` and `DURATION` constrain each other.** RFC 5545 §3.6.2: `DUE` and `DTSTART` must share a value type, `DUE` must be later than `DTSTART`, and `DUE` and `DURATION` must not both appear. Each property can be individually valid while the combination is not — an all-day start with a timed due date has no agreed meaning, and clients are free to read it differently.
+
+22. **`ICAL.Time` normalises rather than rejects.** `2026-02-30` becomes 2 March, `2026-13-01` becomes January 2027, and `25:00:00` becomes 01:00 the next day. `Date.UTC` does the same. A caller gets a successful write back carrying a date it never asked for, which is silent corruption wearing a success message. Validate the calendar fields before conversion.
+
+23. **A wall-clock time can fail to exist.** The hour a spring-forward transition deletes — 01:30 on 2026-03-29 in `Europe/London` — has no instant, and offset arithmetic lands on a different time instead. The only way to notice is to convert, read the result back in the same zone, and check it still shows the reading that was asked for. Fall-back times, which happen twice, do have an answer; pick one deliberately and document it.
+
+24. **`toJSDate()` resolves floating and whole-day values against the process timezone.** `2026-01-01T12:00:00` becomes `17:00Z` under `TZ=America/New_York` and `03:00Z` under `TZ=Asia/Tokyo`. Any filter built on it silently selects a different set of tasks depending on which machine the server runs on. Convert floating and date-only values explicitly instead.
+
+25. **Node's `fetch` follows redirects anywhere, including cross-origin.** A DAV endpoint that answers with a 302 can point the process at `localhost`, a cloud metadata service, or anything else the host can reach, and the response comes back through tool output. Node strips `Authorization` across origins, which protects the credential but neither prevents the request nor stops the disclosure — and a body-carrying method forwards its body. Use `redirect: 'manual'` and an explicit same-origin policy.
+
 ## Discovery
 
 | Step | Method | Path | Property |

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it } from 'node:test';
 
-import { buildTree, dateSortKey } from './api.js';
+import { buildTree, dateBoundKey, dateSortKey, TasksApi } from './api.js';
 import {
   buildCalendarQuery,
   buildMultiget,
@@ -12,7 +15,7 @@ import {
   propKey,
 } from './caldav.js';
 import { canonicalizeBaseUrl, DEFAULT_TIMEOUT_MS, loadConfig, MAX_TIMEOUT_MS } from './config.js';
-import { encodeSegment, normalizeEtag } from './http.js';
+import { encodeSegment, NextcloudClient, normalizeEtag } from './http.js';
 import {
   applyEdits,
   buildTaskIcs,
@@ -553,6 +556,7 @@ function task(partial: Partial<Task> & { uid: string }): Task {
     list: 'personal',
     status: 'NEEDS-ACTION',
     categories: [],
+    recurring: false,
     alarmCount: 0,
     ...partial,
   };
@@ -602,6 +606,104 @@ describe('buildTree', () => {
     const roots = buildTree([task({ uid: 'a', parentUid: 'a' })]);
     assert.equal(roots.length, 1);
     assert.equal(roots[0]?.subtasks.length, 0);
+  });
+
+  // #3: UIDs are per-list, so a global key collides across lists.
+  it('keeps both tasks when the same uid exists in two lists', () => {
+    const roots = buildTree([
+      task({ uid: 'same', list: 'one', summary: 'one' }),
+      task({ uid: 'same', list: 'two', summary: 'two' }),
+    ]);
+    assert.equal(roots.length, 2);
+    assert.deepEqual(roots.map((r) => r.summary).sort(), ['one', 'two']);
+  });
+
+  it('does not resolve a parent link across lists', () => {
+    const roots = buildTree([
+      task({ uid: 'parent', list: 'one' }),
+      task({ uid: 'child', list: 'two', parentUid: 'parent' }),
+    ]);
+    assert.equal(roots.length, 2);
+    assert.equal(roots.find((r) => r.uid === 'parent')?.subtasks.length, 0);
+  });
+
+  it('nests within a list while another list has the same uids', () => {
+    const roots = buildTree([
+      task({ uid: 'p', list: 'one' }),
+      task({ uid: 'c', list: 'one', parentUid: 'p' }),
+      task({ uid: 'p', list: 'two' }),
+      task({ uid: 'c', list: 'two', parentUid: 'p' }),
+    ]);
+    assert.equal(roots.length, 2);
+    for (const root of roots) {
+      assert.equal(root.subtasks.length, 1);
+      assert.equal(root.subtasks[0]?.list, root.list);
+    }
+  });
+
+  // #4: a cycle gives every node a parent, so none would become a root.
+  it('keeps every task visible when the data contains a two-node cycle', () => {
+    const roots = buildTree([
+      task({ uid: 'a', parentUid: 'b' }),
+      task({ uid: 'b', parentUid: 'a' }),
+    ]);
+    const seen = new Set<string>();
+    const walk = (nodes: typeof roots): void => {
+      for (const n of nodes) {
+        assert.equal(seen.has(n.uid), false, `${n.uid} appeared twice`);
+        seen.add(n.uid);
+        walk(n.subtasks);
+      }
+    };
+    walk(roots);
+    assert.deepEqual([...seen].sort(), ['a', 'b']);
+  });
+
+  it('keeps every task visible in a longer cycle', () => {
+    const roots = buildTree([
+      task({ uid: 'a', parentUid: 'c' }),
+      task({ uid: 'b', parentUid: 'a' }),
+      task({ uid: 'c', parentUid: 'b' }),
+    ]);
+    const seen: string[] = [];
+    const walk = (nodes: typeof roots): void => {
+      for (const n of nodes) {
+        seen.push(n.uid);
+        walk(n.subtasks);
+      }
+    };
+    walk(roots);
+    assert.deepEqual(seen.sort(), ['a', 'b', 'c']);
+  });
+
+  it('serialises a cyclic input without recursing forever', () => {
+    const roots = buildTree([
+      task({ uid: 'a', parentUid: 'b' }),
+      task({ uid: 'b', parentUid: 'a' }),
+    ]);
+    assert.doesNotThrow(() => JSON.stringify(roots));
+  });
+
+  it('returns every input task exactly once for a mixed input', () => {
+    const input = [
+      task({ uid: 'root' }),
+      task({ uid: 'kid', parentUid: 'root' }),
+      task({ uid: 'orphan', parentUid: 'gone' }),
+      task({ uid: 'x', parentUid: 'y' }),
+      task({ uid: 'y', parentUid: 'x' }),
+      task({ uid: 'dup', list: 'other' }),
+      task({ uid: 'dup' }),
+    ];
+    const roots = buildTree(input);
+    let count = 0;
+    const walk = (nodes: typeof roots): void => {
+      for (const n of nodes) {
+        count++;
+        walk(n.subtasks);
+      }
+    };
+    walk(roots);
+    assert.equal(count, input.length);
   });
 });
 
@@ -768,5 +870,536 @@ describe('dispatchTool argument validation', () => {
       /Invalid arguments/,
     );
     assert.match(await callTool('list_tasks', { status: ['DONE'] }), /Invalid arguments/);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Regression tests for the issues reported against d6f8c93
+// -----------------------------------------------------------------------------
+
+describe('parseXml rejects character data outside the root (#12)', () => {
+  it('rejects leading and trailing text', () => {
+    assert.throws(() => parseXml('garbage<r/>'), XmlParseError);
+    assert.throws(() => parseXml('<r/>garbage'), XmlParseError);
+    assert.throws(() => parseXml('  ok <r/>'), XmlParseError);
+    assert.throws(() => parseXml('<r/> trailing words'), XmlParseError);
+  });
+
+  it('rejects an HTML error page concatenated onto a multistatus', () => {
+    const doc = '<d:multistatus xmlns:d="DAV:"></d:multistatus>502 Bad Gateway';
+    assert.throws(() => parseXml(doc), XmlParseError);
+  });
+
+  it('rejects a CDATA section at the top level', () => {
+    assert.throws(() => parseXml('<![CDATA[hi]]><r/>'), XmlParseError);
+  });
+
+  it('still allows whitespace and a byte-order mark around the root', () => {
+    assert.doesNotThrow(() => parseXml('\n  <r/>\n  '));
+    assert.doesNotThrow(() => parseXml('﻿<?xml version="1.0"?>\n<r/>\n'));
+  });
+});
+
+describe('parseDateInput rejects dates that do not exist (#5)', () => {
+  it('refuses an out-of-range day or month instead of normalising it', () => {
+    // Previously: "2026-02-30" silently became 2026-03-02.
+    assert.throws(() => parseDateInput('2026-02-30'), /30 does not exist|has 28 days/);
+    assert.throws(() => parseDateInput('2026-13-01'), /month 13/);
+    assert.throws(() => parseDateInput('2026-00-10'), /month 0/);
+    assert.throws(() => parseDateInput('2026-01-00'), /day 0/);
+  });
+
+  it('accepts a real leap day and refuses a fake one', () => {
+    assert.equal(parseDateInput('2024-02-29').toICALString(), '20240229');
+    assert.throws(() => parseDateInput('2026-02-29'), IcalError);
+  });
+
+  it('refuses an out-of-range time instead of rolling it over', () => {
+    // Previously: "2026-01-01T25:00:00" silently became 2026-01-02T01:00:00.
+    assert.throws(() => parseDateInput('2026-01-01T25:00:00'), /hour 25/);
+    assert.throws(() => parseDateInput('2026-01-01T12:60:00'), /minute 60/);
+    assert.throws(() => parseDateInput('2026-01-01T12:00:61'), /second 61/);
+  });
+
+  it('refuses a wall-clock time the zone skips for daylight saving', () => {
+    // London jumps 01:00 -> 02:00 on 2026-03-29, so 01:30 never happens.
+    assert.throws(
+      () => parseDateInput('2026-03-29T01:30:00', 'Europe/London'),
+      /does not exist in Europe\/London/,
+    );
+    // The hour either side is fine.
+    assert.doesNotThrow(() => parseDateInput('2026-03-29T00:30:00', 'Europe/London'));
+    assert.doesNotThrow(() => parseDateInput('2026-03-29T02:30:00', 'Europe/London'));
+  });
+
+  it('resolves an ambiguous fall-back time deterministically', () => {
+    // London repeats 01:00-02:00 on 2026-10-25, so 01:30 happens twice: once as
+    // BST (00:30Z) and once as GMT (01:30Z). The later instant is chosen, and
+    // the point of the test is that it does not vary by machine.
+    const time = parseDateInput('2026-10-25T01:30:00', 'Europe/London');
+    assert.equal(time.toICALString(), '20261025T013000Z');
+  });
+});
+
+describe('due-date ordering is independent of the process timezone (#6)', () => {
+  it('resolves a zoned task date in its own zone, not as UTC', () => {
+    // Previously read as 09:00Z; New York is UTC-5 in January.
+    assert.equal(
+      dateSortKey({ value: '2026-01-01T09:00:00', isDate: false, timezone: 'America/New_York' }),
+      Date.parse('2026-01-01T14:00:00Z'),
+    );
+    assert.equal(
+      dateSortKey({ value: '2026-07-01T09:00:00', isDate: false, timezone: 'Europe/London' }),
+      Date.parse('2026-07-01T08:00:00Z'),
+    );
+  });
+
+  it('orders a zoned task correctly against a UTC one', () => {
+    const zoned = dateSortKey({
+      value: '2026-01-01T09:00:00',
+      isDate: false,
+      timezone: 'America/New_York',
+    })!;
+    const utc = dateSortKey({ value: '2026-01-01T12:00:00Z', isDate: false })!;
+    // 09:00 New York is 14:00Z, so it sorts after 12:00Z.
+    assert.ok(zoned > utc, `${zoned} should be after ${utc}`);
+  });
+
+  it('reads a floating and a whole-day value as UTC, per the documented convention', () => {
+    assert.equal(
+      dateSortKey({ value: '2026-01-01T12:00:00', isDate: false }),
+      Date.parse('2026-01-01T12:00:00Z'),
+    );
+    assert.equal(
+      dateSortKey({ value: '2026-01-01', isDate: true }),
+      Date.parse('2026-01-01T00:00:00Z'),
+    );
+  });
+});
+
+describe('recurrence detection covers RDATE-only series (#9)', () => {
+  const rdateOnly = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:rdate-only
+SUMMARY:Repeats on explicit dates
+RDATE:20261001T090000Z,20261101T090000Z
+END:VTODO
+END:VCALENDAR`;
+
+  it('marks an RDATE-only task as recurring', () => {
+    const t = taskFromIcs(rdateOnly, { href: '/x', list: 'p' })!;
+    assert.equal(t.recurring, true);
+    assert.equal(t.recurrenceRule, undefined);
+    assert.match(t.recurrenceDates!, /20261001T090000Z/);
+  });
+
+  it('still marks an RRULE task as recurring', () => {
+    const ics = rdateOnly.replace('RDATE:20261001T090000Z,20261101T090000Z', 'RRULE:FREQ=WEEKLY');
+    const t = taskFromIcs(ics, { href: '/x', list: 'p' })!;
+    assert.equal(t.recurring, true);
+    assert.match(t.recurrenceRule!, /FREQ=WEEKLY/);
+  });
+
+  it('leaves a one-off task non-recurring', () => {
+    const t = taskFromIcs(FULL_VTODO, { href: '/x', list: 'p' })!;
+    assert.equal(t.recurring, false);
+  });
+});
+
+describe('date invariants are enforced before a write (#8)', () => {
+  it('refuses a whole-day start with a timed due date', () => {
+    assert.throws(
+      () => buildTaskIcs('x', { summary: 'mixed', start: '2026-01-02', due: '2026-01-03T12:00:00Z' }),
+      /same kind/,
+    );
+  });
+
+  it('refuses a due date that is not after the start', () => {
+    assert.throws(
+      () => buildTaskIcs('x', { summary: 'backwards', start: '2026-01-02', due: '2026-01-01' }),
+      /not later than/,
+    );
+    assert.throws(
+      () =>
+        buildTaskIcs('x', {
+          summary: 'equal',
+          start: '2026-01-02T09:00:00Z',
+          due: '2026-01-02T09:00:00Z',
+        }),
+      /not later than/,
+    );
+  });
+
+  it('refuses adding a due date to a task that has a DURATION', () => {
+    const withDuration = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:x
+DTSTART:20260101T120000Z
+DURATION:PT1H
+END:VTODO
+END:VCALENDAR`;
+    const calendar = parseCalendar(withDuration);
+    assert.throws(
+      () => applyEdits(findMasterVtodo(calendar)!, { due: '2026-01-02T12:00:00Z' }),
+      /DURATION/,
+    );
+    // The duration is left in place rather than silently deleted.
+    assert.match(serializeCalendar(calendar), /DURATION:PT1H/);
+  });
+
+  it('accepts a consistent pair', () => {
+    assert.doesNotThrow(() =>
+      buildTaskIcs('x', { summary: 'ok', start: '2026-01-02', due: '2026-01-03' }),
+    );
+    assert.doesNotThrow(() =>
+      buildTaskIcs('x', {
+        summary: 'ok',
+        start: '2026-01-02T09:00:00Z',
+        due: '2026-01-02T17:00:00Z',
+      }),
+    );
+  });
+
+  it('does not block an unrelated edit on an already-invalid task', () => {
+    const invalid = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:x
+DTSTART;VALUE=DATE:20260102
+DUE:20260101T120000Z
+END:VTODO
+END:VCALENDAR`;
+    const calendar = parseCalendar(invalid);
+    // Another client wrote this; renaming it must still work.
+    assert.doesNotThrow(() => applyEdits(findMasterVtodo(calendar)!, { summary: 'renamed' }));
+    assert.match(serializeCalendar(calendar), /SUMMARY:renamed/);
+  });
+});
+
+describe('date bounds do not depend on the process timezone (#6)', () => {
+  it('reads a whole-day bound as UTC midnight', () => {
+    assert.equal(dateBoundKey('2026-01-01'), Date.parse('2026-01-01T00:00:00Z'));
+  });
+
+  it('reads a floating bound as UTC, matching how task dates are read', () => {
+    assert.equal(dateBoundKey('2026-01-01T12:00:00'), Date.parse('2026-01-01T12:00:00Z'));
+    assert.equal(dateBoundKey('2026-01-01T12:00'), Date.parse('2026-01-01T12:00:00Z'));
+  });
+
+  it('reads an explicit UTC bound as that instant', () => {
+    assert.equal(dateBoundKey('2026-01-01T12:00:00Z'), Date.parse('2026-01-01T12:00:00Z'));
+  });
+
+  it('agrees with dateSortKey so a bound and a task date are comparable', () => {
+    assert.equal(
+      dateBoundKey('2026-01-01'),
+      dateSortKey({ value: '2026-01-01', isDate: true }),
+    );
+    assert.equal(
+      dateBoundKey('2026-01-01T12:00:00'),
+      dateSortKey({ value: '2026-01-01T12:00:00', isDate: false }),
+    );
+  });
+
+  it('still rejects an impossible bound', () => {
+    assert.throws(() => dateBoundKey('2026-02-30', 'dueBefore'), IcalError);
+  });
+
+  it('gives the same answer under two very different process timezones', async () => {
+    // Previously this went through ical.js toJSDate(), which resolves floating
+    // and whole-day values against the process TZ — a 14-hour spread between
+    // London and Tokyo. Run in child processes, since Node caches the zone.
+    const script =
+      "import {dateBoundKey} from './src/api.ts';" +
+      "console.log(JSON.stringify([dateBoundKey('2026-01-01')," +
+      "dateBoundKey('2026-01-01T12:00:00')]));";
+    const run = (tz: string): Promise<string> =>
+      new Promise((resolve, reject) => {
+        execFile(
+          process.execPath,
+          ['--import', 'tsx', '--input-type=module', '--eval', script],
+          { cwd: process.cwd(), env: { ...process.env, TZ: tz } },
+          (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
+        );
+      });
+    const [ny, tokyo] = await Promise.all([run('America/New_York'), run('Asia/Tokyo')]);
+    assert.equal(ny, tokyo);
+    assert.deepEqual(JSON.parse(ny), [
+      Date.parse('2026-01-01T00:00:00Z'),
+      Date.parse('2026-01-01T12:00:00Z'),
+    ]);
+  });
+});
+
+describe('list_tasks sort direction (#11)', () => {
+  it('describes the direction it actually sorts in', () => {
+    const tool = TOOLS.find((t) => t.name === 'list_tasks')!;
+    assert.match(tool.description!, /earliest deadline first/);
+    assert.doesNotMatch(tool.description!, /newest deadline first/);
+  });
+
+  it('puts the nearest deadline first and undated tasks last', () => {
+    const keys = [
+      dateSortKey({ value: '2026-03-01', isDate: true })!,
+      dateSortKey({ value: '2026-01-01', isDate: true })!,
+      dateSortKey(undefined) ?? Number.POSITIVE_INFINITY,
+    ];
+    const sorted = [...keys].sort((a, b) => a - b);
+    assert.equal(sorted[0], dateSortKey({ value: '2026-01-01', isDate: true }));
+    assert.equal(sorted[2], Number.POSITIVE_INFINITY);
+  });
+});
+
+describe('timezone arguments require their date (#7)', () => {
+  it('rejects a timezone-only update that would silently do nothing', async () => {
+    const out = await callTool('update_task', { uid: 'x', dueTimezone: 'Europe/London' });
+    assert.match(out, /Invalid arguments/);
+    assert.match(out, /dueTimezone only applies to a due date/);
+  });
+
+  it('rejects a start timezone without a start date', async () => {
+    const out = await callTool('update_task', { uid: 'x', startTimezone: 'Europe/London' });
+    assert.match(out, /startTimezone only applies to a start date/);
+  });
+
+  it('rejects a timezone alongside clearing the date', async () => {
+    const out = await callTool('update_task', {
+      uid: 'x',
+      due: null,
+      dueTimezone: 'Europe/London',
+    });
+    assert.match(out, /cannot be used while clearing due/);
+  });
+
+  it('rejects the same combination on create_task', async () => {
+    const out = await callTool('create_task', { summary: 'x', dueTimezone: 'Europe/London' });
+    assert.match(out, /dueTimezone only applies to a due date/);
+  });
+
+  it('accepts a timezone given with its date', async () => {
+    const out = await callTool('update_task', {
+      uid: 'x',
+      due: '2026-01-01T09:00:00',
+      dueTimezone: 'Europe/London',
+    });
+    assert.doesNotMatch(out, /Invalid arguments/);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Redirect policy and UID ambiguity, against real local servers
+// -----------------------------------------------------------------------------
+
+/** Start an HTTP server on a loopback port and return it with its base URL. */
+async function startServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<{ url: string; port: number; close: () => Promise<void> }> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+function testClient(baseUrl: string): NextcloudClient {
+  return new NextcloudClient(
+    loadConfig({
+      NEXTCLOUD_URL: baseUrl,
+      NEXTCLOUD_USER: 'alice',
+      NEXTCLOUD_APP_PASSWORD: 'app-password',
+      NEXTCLOUD_TIMEOUT_MS: '5000',
+    }),
+  );
+}
+
+describe('cross-origin redirects are refused (#10)', () => {
+  it('does not fetch a redirect target on another origin', async () => {
+    let sinkHits = 0;
+    const sink = await startServer((_req, res) => {
+      sinkHits++;
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('internal-only-data');
+    });
+    const origin = await startServer((_req, res) => {
+      res.writeHead(302, { Location: `${sink.url}/metadata` });
+      res.end();
+    });
+
+    try {
+      await assert.rejects(
+        () => testClient(origin.url).dav('GET', '/dav'),
+        (err: Error) => {
+          assert.equal(err.name, 'RedirectRefusedError');
+          assert.match(err.message, /leaves the configured Nextcloud origin/);
+          return true;
+        },
+      );
+      // The point of the fix: the request is never made at all.
+      assert.equal(sinkHits, 0, 'the redirect target must never be contacted');
+    } finally {
+      await origin.close();
+      await sink.close();
+    }
+  });
+
+  it('does not forward a write body to a redirect target', async () => {
+    let sinkBody = '';
+    const sink = await startServer((req, res) => {
+      req.on('data', (c) => (sinkBody += c));
+      req.on('end', () => {
+        res.writeHead(200);
+        res.end('ok');
+      });
+    });
+    const origin = await startServer((_req, res) => {
+      res.writeHead(307, { Location: `${sink.url}/steal` });
+      res.end();
+    });
+
+    try {
+      await assert.rejects(
+        () =>
+          testClient(origin.url).putCalendarObject(
+            '/dav/a.ics',
+            'BEGIN:VCALENDAR\r\nSUMMARY:private\r\nEND:VCALENDAR',
+          ),
+        (err: Error) => err.name === 'RedirectRefusedError',
+      );
+      assert.equal(sinkBody, '', 'task content must not reach the redirect target');
+    } finally {
+      await origin.close();
+      await sink.close();
+    }
+  });
+
+  it('follows a redirect that stays on the configured origin', async () => {
+    let served = 0;
+    const origin = await startServer((req, res) => {
+      if (req.url === '/dav') {
+        res.writeHead(301, { Location: '/dav/' });
+        res.end();
+        return;
+      }
+      served++;
+      res.writeHead(200, { 'Content-Type': 'text/plain', ETag: '"e1"' });
+      res.end('arrived');
+    });
+
+    try {
+      const result = await testClient(origin.url).dav('GET', '/dav');
+      assert.equal(result.status, 200);
+      assert.equal(result.body, 'arrived');
+      assert.equal(served, 1);
+    } finally {
+      await origin.close();
+    }
+  });
+
+  it('refuses a redirect loop rather than following it forever', async () => {
+    const origin = await startServer((_req, res) => {
+      res.writeHead(302, { Location: '/round-and-round' });
+      res.end();
+    });
+    try {
+      await assert.rejects(
+        () => testClient(origin.url).dav('GET', '/dav'),
+        (err: Error) => err.name === 'RedirectRefusedError',
+      );
+    } finally {
+      await origin.close();
+    }
+  });
+});
+
+describe('an ambiguous uid is refused rather than guessed (#2)', () => {
+  /** A CalDAV server with two task lists, both holding the given uid. */
+  function davHandler(uid: string) {
+    return (req: IncomingMessage, res: ServerResponse): void => {
+      const url = req.url ?? '';
+      const send = (body: string): void => {
+        res.writeHead(207, { 'Content-Type': 'application/xml; charset=utf-8' });
+        res.end(body);
+      };
+
+      if (req.method === 'PROPFIND' && url === '/remote.php/dav/') {
+        return send(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>
+          <d:href>/remote.php/dav/</d:href><d:propstat><d:prop>
+          <d:current-user-principal><d:href>/remote.php/dav/principals/users/alice/</d:href></d:current-user-principal>
+          </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`);
+      }
+      if (req.method === 'PROPFIND' && url.includes('/principals/')) {
+        return send(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+          <d:href>${url}</d:href><d:propstat><d:prop>
+          <c:calendar-home-set><d:href>/remote.php/dav/calendars/alice/</d:href></c:calendar-home-set>
+          </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`);
+      }
+      if (req.method === 'PROPFIND' && url === '/remote.php/dav/calendars/alice/') {
+        const calendar = (name: string): string => `<d:response>
+          <d:href>/remote.php/dav/calendars/alice/${name}/</d:href><d:propstat><d:prop>
+          <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+          <d:displayname>${name}</d:displayname>
+          <c:supported-calendar-component-set><c:comp name="VTODO"/></c:supported-calendar-component-set>
+          </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+        return send(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+          ${calendar('one')}${calendar('two')}</d:multistatus>`);
+      }
+      if (req.method === 'REPORT') {
+        const list = url.includes('/one/') ? 'one' : 'two';
+        const ics = `BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VTODO\nUID:${uid}\nSUMMARY:copy in ${list}\nEND:VTODO\nEND:VCALENDAR`;
+        return send(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+          <d:href>${url}${uid}.ics</d:href><d:propstat><d:prop>
+          <d:getetag>"e-${list}"</d:getetag>
+          <c:calendar-data>${ics.replace(/\n/g, '&#13;\n')}</c:calendar-data>
+          </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`);
+      }
+      res.writeHead(404);
+      res.end();
+    };
+  }
+
+  it('reports both lists instead of silently picking one', async () => {
+    const server = await startServer(davHandler('duplicate'));
+    try {
+      const api = new TasksApi(testClient(server.url));
+      await assert.rejects(
+        () => api.findTask('duplicate'),
+        (err: Error) => {
+          assert.equal(err.name, 'AmbiguousError');
+          assert.match(err.message, /exists in 2 task lists/);
+          assert.match(err.message, /one/);
+          assert.match(err.message, /two/);
+          return true;
+        },
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('resolves normally once a list is named', async () => {
+    const server = await startServer(davHandler('duplicate'));
+    try {
+      const api = new TasksApi(testClient(server.url));
+      const { task, list } = await api.findTask('duplicate', 'two');
+      assert.equal(list.uri, 'two');
+      assert.equal(task.summary, 'copy in two');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('refuses a delete it cannot aim unambiguously', async () => {
+    const server = await startServer(davHandler('duplicate'));
+    try {
+      const api = new TasksApi(testClient(server.url));
+      await assert.rejects(() => api.deleteTask('duplicate', undefined), /AmbiguousError|exists in 2/);
+    } finally {
+      await server.close();
+    }
   });
 });

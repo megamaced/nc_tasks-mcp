@@ -18,6 +18,7 @@ import {
   parseDateInput,
   serializeCalendar,
   taskFromIcs,
+  wallClockToUtcMs,
   type TaskEdits,
 } from './ical.js';
 import type { Task, TaskDate, TaskList, TaskStatus, TaskTreeNode } from './types.js';
@@ -38,6 +39,21 @@ export class UnsupportedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'UnsupportedError';
+  }
+}
+
+/** A reference that identified more than one task. */
+export class AmbiguousError extends Error {
+  constructor(
+    uid: string,
+    public readonly lists: readonly string[],
+  ) {
+    super(
+      `The uid "${uid}" exists in ${lists.length} task lists: ${lists.join(', ')}. ` +
+        '[Pass list to say which one you mean. Refusing rather than picking, because ' +
+        'the choice would otherwise decide which task gets changed or deleted.]',
+    );
+    this.name = 'AmbiguousError';
   }
 }
 
@@ -190,6 +206,12 @@ export class TasksApi {
    * With no list to go on, every list is queried — but by UID, so each report
    * matches at most one object and the cost is a round-trip per list rather
    * than a download of every task in the account.
+   *
+   * A UID is only unique *within* a list, so searching every list can find more
+   * than one. That is not hypothetical: an interrupted `move_task` deliberately
+   * leaves both copies in place. Taking the first match would make task-list
+   * ordering decide which task an update or a delete lands on, so an ambiguous
+   * UID is refused instead.
    */
   async findTask(uid: string, listRef?: string): Promise<{ task: Task; list: TaskList }> {
     const candidates = listRef ? [await this.resolveList(listRef)] : await this.taskLists();
@@ -202,14 +224,20 @@ export class TasksApi {
       }),
     );
 
-    const hit = found.find((f) => f !== null);
-    if (!hit) {
+    const hits = found.filter((f): f is { task: Task; list: TaskList } => f !== null);
+    if (hits.length === 0) {
       throw new NotFoundError(
         `No task with uid "${uid}"${listRef ? ` in ${listRef}` : ''}.`,
         'Use list_tasks to find the uid, or pass a different list.',
       );
     }
-    return hit;
+    if (hits.length > 1) {
+      throw new AmbiguousError(
+        uid,
+        hits.map((h) => h.list.uri),
+      );
+    }
+    return hits[0]!;
   }
 
   /** Create a task and return it as stored. */
@@ -265,11 +293,15 @@ export class TasksApi {
     etag?: string,
   ): Promise<Task> {
     const { task, list } = await this.findTask(uid, listRef);
-    if (task.recurrenceRule) {
+    if (task.recurring) {
+      // Either mechanism makes it a series: a rule, explicit dates, or both.
+      const how = task.recurrenceRule
+        ? task.recurrenceRule
+        : `RDATE:${task.recurrenceDates ?? 'explicit dates'}`;
       throw new UnsupportedError(
-        `"${task.summary ?? uid}" repeats (${task.recurrenceRule}). Completing a repeating ` +
-          'task has to advance it to its next occurrence, which this server does not do — ' +
-          'closing it here would end the series. Complete it in the Nextcloud Tasks app.',
+        `"${task.summary ?? uid}" repeats (${how}). Completing a repeating task has to ` +
+          'advance it to its next occurrence, which this server does not do — closing it ' +
+          'here would end the series. Complete it in the Nextcloud Tasks app.',
       );
     }
     if (list.readOnly) {
@@ -532,17 +564,52 @@ function toTasks(objects: readonly CalendarObject[], listUri: string): Task[] {
  */
 export function dateSortKey(date: TaskDate | undefined): number | undefined {
   if (!date) return undefined;
+
+  // A zoned value is a wall-clock reading in that zone, so it has to be
+  // resolved there. Appending Z instead would read 09:00 New York as 09:00 UTC
+  // and sort the task five hours early — and filter it into the wrong window.
+  if (date.timezone && !date.isDate) {
+    const ms = wallClockToUtcMs(date.value, date.timezone);
+    if (ms !== undefined) return ms;
+  }
+
   const text = date.isDate ? `${date.value}T00:00:00Z` : date.value;
   const ms = Date.parse(text.endsWith('Z') ? text : `${text}Z`);
   return Number.isFinite(ms) ? ms : undefined;
 }
 
-/** Resolve a caller's date bound to a comparable instant. */
-function boundToMs(bound: string, label: string): number {
-  const time = parseDateInput(bound);
-  const ms = time.toJSDate().getTime();
+/**
+ * Resolve a caller's date bound to the same scale {@link dateSortKey} uses.
+ *
+ * Deliberately not `parseDateInput(...).toJSDate()`: ical.js resolves a
+ * floating or date-only value against the *process* timezone, so the same
+ * `dueBefore: "2026-01-01"` selected a different set of tasks depending on the
+ * `TZ` of the machine running the server — a 14-hour spread between London and
+ * Tokyo. Bounds are read as UTC, matching how `dateSortKey` reads the floating
+ * and whole-day task values they are compared against.
+ */
+export function dateBoundKey(bound: string, label = 'date bound'): number {
+  const text = bound.trim();
+  // Validates the grammar and rejects impossible dates; the value is discarded.
+  parseDateInput(text);
+
+  const zulu = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)Z$/.exec(text);
+  const local = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)$/.exec(text);
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(text);
+
+  let iso: string;
+  if (dateOnly) iso = `${text}T00:00:00Z`;
+  else if (zulu) iso = `${zulu[1]}T${padSeconds(zulu[2]!)}Z`;
+  else if (local) iso = `${local[1]}T${padSeconds(local[2]!)}Z`;
+  else throw new IcalError(`Invalid ${label}: ${bound}`);
+
+  const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) throw new IcalError(`Invalid ${label}: ${bound}`);
   return ms;
+}
+
+function padSeconds(time: string): string {
+  return time.length === 5 ? `${time}:00` : time;
 }
 
 function applyFilters(tasks: Task[], opts: ListTasksOptions): Task[] {
@@ -556,8 +623,8 @@ function applyFilters(tasks: Task[], opts: ListTasksOptions): Task[] {
     out = out.filter((t) => wanted.has(t.status));
   }
 
-  const before = opts.dueBefore === undefined ? undefined : boundToMs(opts.dueBefore, 'dueBefore');
-  const after = opts.dueAfter === undefined ? undefined : boundToMs(opts.dueAfter, 'dueAfter');
+  const before = opts.dueBefore === undefined ? undefined : dateBoundKey(opts.dueBefore, 'dueBefore');
+  const after = opts.dueAfter === undefined ? undefined : dateBoundKey(opts.dueAfter, 'dueAfter');
   if (before !== undefined || after !== undefined) {
     out = out.filter((t) => {
       const due = dateSortKey(t.due);
@@ -617,19 +684,65 @@ function compareTasks(a: Task, b: Task): number {
 /**
  * Nest tasks under their parents.
  *
- * A task whose parent is not in the result set stays at the top level rather
- * than disappearing: the parent may be completed, filtered out, or in another
- * list, and dropping the child would silently lose it from the answer.
+ * Every input task appears exactly once in the output. Three things could
+ * otherwise silently drop one, and all three are reachable from real data:
+ *
+ *  - **UIDs are per-list.** `list_tasks` searches every list by default, so the
+ *    same UID can arrive twice from different lists. Keyed by UID alone, the
+ *    second would overwrite the first and a task would vanish from the answer
+ *    while still being counted. The key is `(list, uid)`, and a parent link
+ *    only resolves within the child's own list — which is also the only place
+ *    `RELATED-TO` is meaningful.
+ *  - **A parent may be missing** — completed, filtered out, or in another list.
+ *    The child stays at the top level rather than disappearing.
+ *  - **The data may contain a cycle.** This server refuses to create one, but
+ *    another CalDAV client or a pair of concurrent updates can still write one.
+ *    Every node in a cycle has a parent, so none would ever become a root and
+ *    the whole cycle would silently vanish from a read. Cycles are detected and
+ *    broken at the node that closes them, which is then surfaced as a root.
  */
 export function buildTree(tasks: readonly Task[]): TaskTreeNode[] {
+  const key = (list: string, uid: string): string => `${list}\u0000${uid}`;
+
   const nodes = new Map<string, TaskTreeNode>();
-  for (const task of tasks) nodes.set(task.uid, { ...task, subtasks: [] });
+  const order: string[] = [];
+  for (const task of tasks) {
+    const k = key(task.list, task.uid);
+    // A genuine duplicate of the same (list, uid) is a server-side impossibility,
+    // but keep the first rather than overwriting, so nothing is lost either way.
+    if (nodes.has(k)) continue;
+    nodes.set(k, { ...task, subtasks: [] });
+    order.push(k);
+  }
+
+  const parentOf = (k: string): string | undefined => {
+    const node = nodes.get(k);
+    if (!node?.parentUid) return undefined;
+    const parentKey = key(node.list, node.parentUid);
+    return parentKey !== k && nodes.has(parentKey) ? parentKey : undefined;
+  };
+
+  /**
+   * Whether attaching `k` to its parent would close a loop.
+   *
+   * Walks up from the parent; if it arrives back at `k`, the link is part of a
+   * cycle. Bounded by the node count, so a cycle cannot spin here.
+   */
+  const closesCycle = (k: string): boolean => {
+    let step = parentOf(k);
+    for (let guard = 0; step !== undefined && guard <= nodes.size; guard++) {
+      if (step === k) return true;
+      step = parentOf(step);
+    }
+    return false;
+  };
 
   const roots: TaskTreeNode[] = [];
-  for (const node of nodes.values()) {
-    const parent = node.parentUid ? nodes.get(node.parentUid) : undefined;
-    if (parent && parent !== node) parent.subtasks.push(node);
-    else roots.push(node);
+  for (const k of order) {
+    const node = nodes.get(k)!;
+    const parentKey = parentOf(k);
+    if (parentKey === undefined || closesCycle(k)) roots.push(node);
+    else nodes.get(parentKey)!.subtasks.push(node);
   }
   return roots;
 }

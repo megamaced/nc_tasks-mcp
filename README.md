@@ -25,6 +25,16 @@ Every tool declares MCP annotations (`readOnlyHint`, `destructiveHint`, `idempot
 
 Only the fields you pass are changed. Passing `null` clears a field, which is a different request from omitting it: "no due date given" and "remove the due date" are both expressible.
 
+### Safety rails
+
+The server refuses rather than guesses where guessing would be silent:
+
+- **An ambiguous uid.** UIDs are per-list, so searching every list can find more than one — an interrupted `move_task` deliberately leaves two copies. Rather than let list ordering decide which task an update or delete lands on, tools report the matching lists and ask you to name one.
+- **Dates that do not exist.** `2026-02-30`, `2026-13-01` and `25:00:00` are rejected, not quietly normalised to a different date. So is a wall-clock time a zone skips for daylight saving.
+- **Contradictory dates.** RFC 5545 requires `DUE` and `DTSTART` to share a value type with `DUE` later than `DTSTART`, and forbids `DUE` alongside `DURATION`. Combinations that break those rules are rejected before the write, when an edit touched a date — a task another client already wrote in an invalid state stays fully editable in every other respect.
+- **Timezones with nothing to qualify.** `dueTimezone` without `due` would change nothing while still bumping the task's revision, so it is an error rather than a silent no-op.
+- **Redirects off the configured origin.** Node's `fetch` follows redirects anywhere by default, which would let a compromised endpoint point this process at `localhost` or a metadata service and return the response through tool output. Only same-origin redirects are followed, plus an http→https upgrade on the same host.
+
 ### Concurrency
 
 `get_task` returns the task's `etag`. Passing it back to `update_task`, `complete_task` or `delete_task` makes the write conditional — if the task changed on the server in the meantime, the write is refused. Unlike the Notes API, a CalDAV 412 carries no body, so the error says how to get the current state rather than pretending to carry it.
@@ -53,7 +63,7 @@ Re-parenting is checked for cycles, and a task cannot be its own parent.
 
 ### Repeating tasks
 
-`complete_task` refuses a task with an `RRULE`. Completing a repeating task has to advance it to its next occurrence; writing `STATUS:COMPLETED` onto the master component instead ends the series permanently, and the occurrences still to come cannot be recovered from it. Recurrence is reported on every task as `recurrenceRule` and preserved through every write — it is just not editable here. Complete or edit repeating tasks in the Tasks UI.
+`complete_task` refuses a task that repeats — by `RRULE`, by explicit `RDATE`s, or both. Completing a repeating task has to advance it to its next occurrence; writing `STATUS:COMPLETED` onto the master component instead ends the series permanently, and the occurrences still to come cannot be recovered from it. Recurrence is reported on every task as `recurrenceRule` and preserved through every write — it is just not editable here. Complete or edit repeating tasks in the Tasks UI.
 
 ## Install
 

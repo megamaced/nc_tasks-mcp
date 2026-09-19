@@ -1,8 +1,15 @@
 import { z, type ZodTypeAny } from 'zod';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
-import { buildTree, NotFoundError, UnsupportedError, type TasksApi, type TaskEdits } from './api.js';
-import { ConflictError, HttpError } from './http.js';
+import {
+  AmbiguousError,
+  buildTree,
+  NotFoundError,
+  UnsupportedError,
+  type TasksApi,
+  type TaskEdits,
+} from './api.js';
+import { ConflictError, HttpError, RedirectRefusedError } from './http.js';
 import { IcalError } from './ical.js';
 import { TASK_STATUSES, type Task } from './types.js';
 import { XmlParseError } from './xml.js';
@@ -292,7 +299,7 @@ const listTasksTool: ToolDef<typeof ListTasksArgs> = {
   tool: {
     name: 'list_tasks',
     description:
-      'List tasks, newest deadline first. Searches every task list unless one is named. ' +
+      'List tasks, earliest deadline first. Searches every task list unless one is named. ' +
       'Completed and cancelled tasks are excluded unless includeCompleted is true. ' +
       'Results are sorted by due date, then priority, then title.',
     inputSchema: {
@@ -439,7 +446,8 @@ const CreateTaskArgs = z
     summary: z.string().trim().min(1, 'summary must not be empty'),
     list: z.string().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(checkTimezonePairs);
 
 const createTaskTool: ToolDef<typeof CreateTaskArgs> = {
   argsSchema: CreateTaskArgs,
@@ -471,6 +479,40 @@ const createTaskTool: ToolDef<typeof CreateTaskArgs> = {
   },
 };
 
+/**
+ * Reject a timezone given without the date it qualifies.
+ *
+ * `dueTimezone` is only ever read alongside `due`, so on its own it changes
+ * nothing — but it satisfies the "at least one field" check, so the call
+ * succeeds, rewrites `DTSTAMP` and `LAST-MODIFIED`, and can lose a concurrent
+ * edit to a conflict while silently ignoring the only thing that was asked for.
+ * A no-op that reports success is worse than an error.
+ */
+function checkTimezonePairs(
+  args: { due?: unknown; dueTimezone?: unknown; start?: unknown; startTimezone?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  for (const [zone, date] of [
+    ['dueTimezone', 'due'],
+    ['startTimezone', 'start'],
+  ] as const) {
+    if (args[zone] === undefined) continue;
+    if (args[date] === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [zone],
+        message: `${zone} only applies to a ${date} date, so pass ${date} as well.`,
+      });
+    } else if (args[date] === null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [zone],
+        message: `${zone} cannot be used while clearing ${date}.`,
+      });
+    }
+  }
+}
+
 const UpdateTaskArgs = z
   .object({
     uid: Uid,
@@ -482,7 +524,8 @@ const UpdateTaskArgs = z
   .refine(
     (a) => Object.keys(EditArgs).some((k) => a[k as keyof typeof EditArgs] !== undefined),
     { message: `Supply at least one field to change: ${Object.keys(EditArgs).join(', ')}.` },
-  );
+  )
+  .superRefine(checkTimezonePairs);
 
 const updateTaskTool: ToolDef<typeof UpdateTaskArgs> = {
   argsSchema: UpdateTaskArgs,
@@ -732,8 +775,10 @@ export async function dispatchTool(
     if (
       err instanceof ConflictError ||
       err instanceof NotFoundError ||
+      err instanceof AmbiguousError ||
       err instanceof UnsupportedError ||
       err instanceof IcalError ||
+      err instanceof RedirectRefusedError ||
       err instanceof HttpError
     ) {
       return errorResult(err.message);
