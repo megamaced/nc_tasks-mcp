@@ -25,7 +25,7 @@
     "pack:tarball": "tsc -p tsconfig.build.json && npm pack"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.30.1",
     "ical.js": "^2.2.1",
     "zod": "^4.5.4"
   },
